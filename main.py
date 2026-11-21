@@ -13,6 +13,7 @@ import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -71,6 +72,8 @@ from gemini_wire import active_spec as active_model_spec
 from gemini_wire import install as install_wire_shim
 from gemini_wire import pop_spec as gemini_wire_pop_spec
 from gemini_wire import push_spec as gemini_wire_push_spec
+from request_cache import RequestRegistry
+from request_cache import fingerprint as request_fingerprint
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -83,6 +86,10 @@ gemini_client_lock = asyncio.Lock()
 # 多 Cookie 轮询池：一个进程挂多个 Gemini 账号，请求轮询分配、失败自动换号
 gemini_pool = None
 gemini_pool_lock = asyncio.Lock()
+#: 同请求合并 / 答案重放（见 request_cache.py）
+request_registry = RequestRegistry()
+#: 当前请求的 id，写进日志和响应头，用来把一次调用在几十行日志里串起来
+REQUEST_ID: ContextVar[str] = ContextVar("request_id", default="-")
 
 
 def _env_number(name: str, default, cast=float):
@@ -720,6 +727,25 @@ async def verify_api_key(authorization: str = Header(None)):
 
 
 # Simple error handler middleware
+@app.middleware("http")
+async def attach_request_id(request: Request, call_next):
+	"""给每个请求挂一个 id：写入日志，并回在 X-Request-Id 头里。
+
+	没有它的话，多账号轮询 + 换号重试会让一次调用在日志里散成互不相干的几行。
+	客户端自己带了 x-request-id 就沿用，方便和服务端日志对齐。
+	"""
+	request_id = (request.headers.get("x-request-id") or "").strip() or uuid.uuid4().hex[:12]
+	token = REQUEST_ID.set(request_id)
+	try:
+		response = await call_next(request)
+	except Exception:
+		REQUEST_ID.reset(token)
+		raise
+	response.headers["X-Request-Id"] = request_id
+	REQUEST_ID.reset(token)
+	return response
+
+
 @app.middleware("http")
 async def error_handling(request: Request, call_next):
 	"""
@@ -1547,8 +1573,21 @@ async def create_chat_completion(
 			return StreamingResponse(generate_stream(), media_type="text/event-stream")
 		else:
 			# Non-streaming response：借号 / 换号重试 / 归还都在 generate_with_cookie_pool 里
+			# 同指纹请求只打一次上游：SDK/反代的重试会把同一份 prompt 并发打进来，
+			# 每并发一次就多用一次同一账号，Google 会以会话异常为由吊销 1PSIDTS。
+			replay_key = request_fingerprint(request.model_dump(exclude_none=True))
+			replayed = request_registry.replay(replay_key)
+			if replayed is not None:
+				logger.info("Replayed identical request: request_id=%s", REQUEST_ID.get())
+				return replayed
+
 			try:
-				response, gemini_client = await generate_with_cookie_pool(pool, conversation, gen_kwargs, model_spec)
+				(response, gemini_client), shared = await request_registry.coalesce(
+					replay_key,
+					lambda: generate_with_cookie_pool(pool, conversation, gen_kwargs, model_spec),
+				)
+				if shared:
+					logger.info("Joined an in-flight identical request: request_id=%s", REQUEST_ID.get())
 
 				if AUTO_DELETE_CHAT and hasattr(response, "metadata") and response.metadata and len(response.metadata) > 0:
 					cid = response.metadata[0]
@@ -1651,7 +1690,13 @@ async def create_chat_completion(
 				},
 			}
 
-			logger.info("Non-streaming response completed: tool_calls=%s", len(tool_calls))
+			# 答案进重放窗口：窗口内的重试直接复用，不再打上游
+			request_registry.remember(replay_key, result)
+			logger.info(
+				"Non-streaming response completed: tool_calls=%s request_id=%s",
+				len(tool_calls),
+				REQUEST_ID.get(),
+			)
 			return result
 
 	except HTTPException:
