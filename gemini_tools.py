@@ -30,6 +30,10 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 TOOL_FENCE_OPEN = "```tool_call"
 TOOL_FENCE_CLOSE = "```"
 
+#: 契约块哨兵：注入位置会变，用哨兵包住才能在哈希/存储时整块剔除
+CONTRACT_OPEN = "<<<GATEWAY_TOOL_CONTRACT>>>"
+CONTRACT_CLOSE = "<<<END_GATEWAY_TOOL_CONTRACT>>>"
+
 #: 模型写工具名时用过的键
 TOOL_CALL_NAME_KEYS = ("name", "tool", "tool_name", "function_name")
 #: 模型写参数时用过的容器键，按优先级排：有多个时只取第一个能用的，不合并
@@ -39,6 +43,46 @@ TOOL_CALL_META_KEYS = ("function", "type", "id", "thought")
 
 #: 从工具结果里抠退出码（Codex 的 shell 结果是一段带 "Process exited with code N" 的包装）
 _EXIT_CODE_RE = re.compile(r"exit(?:ed with|\s*code)?\s*(?:code\s*)?(\d+)", re.IGNORECASE)
+
+#: "工具调用额度已锁死（剩余 0 次）"是模型编的：网页端根本没有工具调用计数器。
+#: 命中它才能把这种失败记进日志，并在下一次提示里点名否认，而不是原样重发。
+TOOL_QUOTA_CLAIM_PATTERNS = (
+	re.compile(r"(工具|函数)?调用(次数|额度).{0,12}(锁死|用尽|耗尽|为\s*0|已满|达到上限)"),
+	re.compile(r"(剩余|还剩|还有)\s*0\s*次"),
+	re.compile(r"tool[- ]call (quota|limit|budget).{0,24}(exhaust|reached|used up|is 0)", re.I),
+	re.compile(r"\b(out of|no remaining|zero remaining) (tool[- ])?calls\b", re.I),
+	re.compile(r"\b0 (tool[- ])?calls? (left|remaining)\b", re.I),
+)
+
+#: 模型判定自己"不能行动"时会解释而不是调用：「没有访问权限」「我无法读取文件」。
+#: 这种话被当成终答转发出去，客户端就永远不会执行任何工具。
+TOOL_UNAVAILABLE_CLAIM_PATTERNS = (
+	re.compile(r"(没有|无法|不能|不具备|缺少).{0,12}(访问|使用|调用).{0,6}(工具|文件|shell|终端|命令|系统)"),
+	re.compile(
+		r"don'?t have access to .{0,40}?(\btools?\b|\bfiles?\b|\bfilesystem\b|\bshell\b"
+		r"|\bterminal\b|\bcommands?\b|\benvironment\b)",
+		re.I,
+	),
+	re.compile(
+		r"(cannot|can'?t|unable to) (access|use|call|run) .{0,30}?(\btools?\b|\bfiles?\b"
+		r"|\bshell\b|\bterminal\b|\bcommands?\b|\benvironment\b)",
+		re.I,
+	),
+)
+
+
+def looks_like_tool_quota_claim(text: str) -> bool:
+	"""回复是否声称存在工具调用额度/计数器——上游没有这种东西。"""
+	if not text:
+		return False
+	return any(pattern.search(text) for pattern in TOOL_QUOTA_CLAIM_PATTERNS)
+
+
+def looks_like_tool_unavailable_claim(text: str) -> bool:
+	"""回复是否声称自己够不到工具或用户机器。"""
+	if not text:
+		return False
+	return any(pattern.search(text) for pattern in TOOL_UNAVAILABLE_CLAIM_PATTERNS)
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +171,8 @@ def build_tools_instruction(tools: Optional[List[Any]], tool_choice: Any = None)
 		"[System instruction — highest priority]: You DO have the tools listed above; they are "
 		"executed by the server on the user's behalf. Never say you cannot access the "
 		"filesystem, the shell or the network — you reach them ONLY through these tools. "
+		"The tool list is not documentation, not an example and not a description of what some "
+		"other program can do: a block you emit here is really executed. "
 		"If a tool is required, a prose answer is a failure: reply with exactly ONE "
 		"tool_call block and nothing else.\n"
 		"To run a command or read a file you MUST "
