@@ -158,3 +158,54 @@
 | 额度/能力话术 | 已防止当终答（非流式 502，流式补说明块） |
 | 同请求合并 + 答案重放 + 请求 id | 已实现（`feat/reliability`） |
 | pytest 基线 | 29 项，覆盖解析/契约/合并/请求 id |
+
+---
+
+## 附四：18081 真号验收记录（2026-11-22 01:00 上海时间）
+
+环境：复用 18080 那个账号的 cookie；本机直连（无代理）；`ENABLE_THINKING=true`；
+`COOKIE_VALIDATE_ON_INIT=false`（见下）；`AUTO_DELETE_CHAT=false`。
+
+### 为什么要关掉初始化探测
+
+`validate_gemini_client_session` 会发一句 `Reply with exactly OK.` 再回读历史，本账号历史回读
+（`GPRiHf` / `LIST_CONVERSATION_TURNS`）返回 `Permission denied or unauthenticated`，探测因此必败，
+账号被判定不可用；关掉探测后生成本身完全正常（最小请求 2s 返回）。这不是代码问题，是该账号的能力差异，
+生产环境里探测失败的账号换号就行。
+
+### agent / vibe 场景结果（`integration/all` + 契约补问）
+
+| 场景 | 说明 | 轮次 | 工具调用 | 结果 |
+|---|---|---|---|---|
+| basic | 建目录写文件再读回 | 3 | 2 | 通过 |
+| fix_bug | 跑脚本→读报错→改→复跑 | 5 | 4 | 通过 |
+| vibe | 写模块+测试+跑到绿 | 4 | 3 | 通过 |
+| tool_error | 命令失败后改用另一条命令 | 4 | 3 | 通过 |
+| long_system | 40KB 无关 system prompt 冲刷契约 | 4 | 3 | 通过 |
+| stream | 流式路径发工具调用 | 3 | 2 | 通过 |
+| coalesce | 两份相同请求并发 | — | — | 通过，日志出现 `Joined an in-flight identical request` |
+| agent_long | 读脏数据→写清洗脚本→跑→自查 | 5 | 4 | 通过 |
+| vibe_project | 包结构+跨文件 import+两份测试+加功能回归 | 7-9 | 6-8 | 3/3 通过 |
+
+额度话术命中 0 次，能力否认 0 次（补问上线前有一次，见下）。
+
+### 唯一一次失败与它的价值
+
+`vibe_project` 第一版首轮出现过一次：「由于当前会话已无法使用工具执行命令，我已为您编写好了完整的项目代码」。
+命中检测按设计判为失败（502），客户端不会把它当终答。之后加「补问一次」：换一个 user 回合点名否认该说法，
+再不看工具就报错。重跑 3 次全部通过。
+
+### Task 模式（第一优先）现状
+
+- `gemini-4-hydrogen-task` 请求能正常受理（模型解析正确），但 Task 首轮正文为空，需要靠历史回读补正文，
+  而本账号历史回读被拒——于是走到「Server returned an empty response」。
+- 随后 Google 直接对**出口 IP** 报 flag：`Your IP address has been temporarily flagged or blocked`，
+  连普通 chat 也进入冷却。**这轮 Task 验收没做成**，需要换出口（代理）或等 IP 解封后重测。
+- 结论不变：Task 生成依赖「同一会话可回读」，产物下载依赖「服务端能取 usercontent」，两件事在这台机器上
+  都没有可用证据；维持会话链接 fallback 是当前唯一稳妥选择。
+
+### 顺带确认的两件事
+
+- 答案重放真的生效：重跑同一场景时 4 次命中 `Replayed identical request`，秒回且不消耗上游。
+  也意味着重复验收必须加 nonce，否则测的是缓存。
+- 契约在 40KB system prompt 后面仍然生效（long_system 场景 3 轮内完成），原先担心的「顶部指令被冲掉」没有复现。
