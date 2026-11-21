@@ -85,6 +85,17 @@ def looks_like_tool_unavailable_claim(text: str) -> bool:
 	return any(pattern.search(text) for pattern in TOOL_UNAVAILABLE_CLAIM_PATTERNS)
 
 
+#: 命中上面两类话术时用的补问。命中即判定这一轮没干活，必须点名否认那套说法再要一次，
+#: 而不是重复同一句请求——原样重发只会拿到同一段借口。
+TOOL_CONTRACT_NUDGE = (
+	"[System instruction — highest priority]: Your previous reply refused to act and claimed you "
+	"cannot reach the tools, or that this session has no tool access or no remaining calls. That "
+	"claim is false: the tools listed above are real, they run in the user's environment, and there "
+	"is no call counter anywhere. The task is not finished. Reply now with exactly ONE tool_call "
+	"block and nothing else — do not explain, do not paste code for the user to run."
+)
+
+
 # ---------------------------------------------------------------------------
 # tool_choice
 # ---------------------------------------------------------------------------
