@@ -55,11 +55,15 @@ from gemini_models import (
 )
 from gemini_task import ensure_task_ready
 from gemini_tools import (
+	CONTRACT_CLOSE,
+	CONTRACT_OPEN,
 	TOOL_FENCE_CLOSE,
 	TOOL_FENCE_OPEN,
 	ToolFenceGate,
 	build_tools_instruction,
 	format_tool_result,
+	looks_like_tool_quota_claim,
+	looks_like_tool_unavailable_claim,
 	parse_tool_calls,
 	tool_calls_for_stream,
 )
@@ -837,6 +841,11 @@ def get_effective_model_debug_info(spec: ModelSpec) -> Dict[str, str]:
 	}
 
 
+def _wrap_tool_contract(text: str) -> str:
+	"""用哨兵包住契约块，方便上层按字节剔除（存库/哈希时不该带上注入内容）。"""
+	return f"{CONTRACT_OPEN}\n{text}\n{CONTRACT_CLOSE}"
+
+
 # Prepare conversation history from OpenAI messages format
 def prepare_conversation(
 	messages: List[Message],
@@ -861,10 +870,16 @@ def prepare_conversation(
 	parts: List[str] = []
 	temp_files: List[str] = []
 
-	# 工具格式指令放最前，末尾还会再锚一次（agentic 客户端的长提示会把顶部指令冲掉）
+	# 工具契约的长度、措辞和末尾锚点见 gemini_tools.build_tools_instruction；
+	# 它的**位置**同样决定成败：
+	#   - 拼成一段无角色的文本放最前 -> 模型称"工具只是提示词里的文本示例"，拒绝调用；
+	#   - 作为第二条独立 system 消息 -> 仍然拒绝；
+	#   - 并入首条 system 消息 -> 立刻按契约发工具调用。
+	# Gemini 网页端只保留一条 system instruction，契约落在它之外就是普通文本。
 	tools_top, tools_bottom = build_tools_instruction(tools, tool_choice)
-	if tools_top:
-		parts.append(tools_top)
+	# skip_system（启用 Gem）时不新建 system 消息，否则会和 Gem 自带 prompt 打架
+	contract = "" if skip_system else tools_top
+	contract_placed = False
 
 	for msg in messages:
 		# 启用 Gem 时跳过 system 消息（Gem 本身就是 system prompt 通道）
@@ -884,7 +899,13 @@ def prepare_conversation(
 		temp_files.extend(images)
 
 		if msg.role == "system":
-			parts.append(f"System: {text}")
+			if contract and not contract_placed:
+				# 契约并入首条 system 消息，客户端自己的提示保持原样跟在后面
+				merged = f"{_wrap_tool_contract(contract)}\n\n{text}" if text else _wrap_tool_contract(contract)
+				parts.append(f"System: {merged}")
+				contract_placed = True
+			else:
+				parts.append(f"System: {text}")
 		elif msg.role == "assistant":
 			block = f"Assistant: {text}"
 			# assistant 的调用记录渲染回围栏，让模型看到自己调过什么
@@ -894,6 +915,13 @@ def prepare_conversation(
 			parts.append(block)
 		else:
 			parts.append(f"Human: {text}")
+
+	if contract and not contract_placed:
+		# 客户端没给 system 消息：自己造首条，契约仍是 prompt 的第一块
+		parts.insert(0, f"System: {_wrap_tool_contract(contract)}")
+	elif tools_top and skip_system:
+		# Gem 模式维持原样：契约作为无角色文本放最前
+		parts.insert(0, tools_top)
 
 	if tools_bottom:
 		parts.append(tools_bottom)
@@ -1457,6 +1485,15 @@ async def create_chat_completion(
 							# 只有一个解析不了的围栏：不能静默回空，客户端会看不出失败
 							logger.warning("Streaming reply had only an unparseable tool_call block")
 							yield make_chunk({"content": "\n\n[上游只返回了一个解析不了的 tool_call 块，请重试]"})
+						elif not stream_tool_calls and (
+							looks_like_tool_quota_claim(clean_text) or looks_like_tool_unavailable_claim(clean_text)
+						):
+							# 正文已经流给客户端了，收不回来；补一条说明，别让客户端把借口当终答
+							logger.warning(
+								"Streaming reply declined a declared tool with a quota/unavailable claim: %s",
+								clean_text[:200],
+							)
+							yield make_chunk({"content": "\n\n[上游声称工具额度/权限不可用而拒绝调用；网页端没有调用额度，请重试]"})
 					elif text_buffer:
 						yield make_chunk({"content": postprocess_text(text_buffer)})
 
@@ -1562,6 +1599,22 @@ async def create_chat_completion(
 						detail="upstream reply had only an unparseable tool_call block; please retry",
 					)
 				raw_text = clean_text
+
+				# 契约已经写明「没有调用额度、工具是真的」，模型仍然编出额度/够不到工具的说辞
+				# 并把话说完，就是这一轮的失败。不能当 200 终答返回：客户端会以为任务做完了，
+				# 实际上一个工具都没执行。网页端没有计数器，这类说法一律是编的。
+				if not tool_calls and (
+					looks_like_tool_quota_claim(raw_text) or looks_like_tool_unavailable_claim(raw_text)
+				):
+					logger.warning(
+						"Non-stream reply declined a declared tool with a quota/unavailable claim: %s",
+						raw_text[:200],
+					)
+					raise HTTPException(
+						status_code=502,
+						detail="upstream answered without calling a tool and claimed it has no tool access or quota; "
+						"no such limit exists — please retry",
+					)
 
 			reply_text = thoughts_text + raw_text
 			# 提取并追加图片响应
