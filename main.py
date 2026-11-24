@@ -58,14 +58,11 @@ from gemini_task import ensure_task_ready
 from gemini_tools import (
 	CONTRACT_CLOSE,
 	CONTRACT_OPEN,
-	TOOL_CONTRACT_NUDGE,
 	TOOL_FENCE_CLOSE,
 	TOOL_FENCE_OPEN,
 	ToolFenceGate,
 	build_tools_instruction,
 	format_tool_result,
-	looks_like_tool_quota_claim,
-	looks_like_tool_unavailable_claim,
 	parse_tool_calls,
 	tool_calls_for_stream,
 )
@@ -873,15 +870,6 @@ def _wrap_tool_contract(text: str) -> str:
 	return f"{CONTRACT_OPEN}\n{text}\n{CONTRACT_CLOSE}"
 
 
-ASSISTANT_TAIL = "Assistant: "
-
-
-def _contract_nudge_conversation(conversation: str) -> str:
-	"""把补问拼成本轮之后的一个 user 回合（去掉原来的 Assistant: 尾巴再补）。"""
-	base = conversation[: -len(ASSISTANT_TAIL)] if conversation.endswith(ASSISTANT_TAIL) else conversation
-	return f"{base}Human: {TOOL_CONTRACT_NUDGE}\n\n{ASSISTANT_TAIL}"
-
-
 # Prepare conversation history from OpenAI messages format
 def prepare_conversation(
 	messages: List[Message],
@@ -1521,15 +1509,6 @@ async def create_chat_completion(
 							# 只有一个解析不了的围栏：不能静默回空，客户端会看不出失败
 							logger.warning("Streaming reply had only an unparseable tool_call block")
 							yield make_chunk({"content": "\n\n[上游只返回了一个解析不了的 tool_call 块，请重试]"})
-						elif not stream_tool_calls and (
-							looks_like_tool_quota_claim(clean_text) or looks_like_tool_unavailable_claim(clean_text)
-						):
-							# 正文已经流给客户端了，收不回来；补一条说明，别让客户端把借口当终答
-							logger.warning(
-								"Streaming reply declined a declared tool with a quota/unavailable claim: %s",
-								clean_text[:200],
-							)
-							yield make_chunk({"content": "\n\n[上游声称工具额度/权限不可用而拒绝调用；网页端没有调用额度，请重试]"})
 					elif text_buffer:
 						yield make_chunk({"content": postprocess_text(text_buffer)})
 
@@ -1648,42 +1627,6 @@ async def create_chat_completion(
 						detail="upstream reply had only an unparseable tool_call block; please retry",
 					)
 				raw_text = clean_text
-
-				# 契约已经写明「没有调用额度、工具是真的」，模型仍然编出额度/够不到工具的说辞
-				# 并把话说完，就是这一轮的失败。不能当 200 终答返回：客户端会以为任务做完了，
-				# 实际上一个工具都没执行。网页端没有计数器，这类说法一律是编的。
-				if not tool_calls and (
-					looks_like_tool_quota_claim(raw_text) or looks_like_tool_unavailable_claim(raw_text)
-				):
-					logger.warning(
-						"Non-stream reply declined a declared tool with a quota/unavailable claim: %s",
-						raw_text[:200],
-					)
-					# 补问一次：把那套说法点名否认。原样重发只会拿到同一段借口，
-					# 但补问会换一个 user 回合，模型得重新决策。
-					retry_calls: List[Dict[str, Any]] = []
-					if not model_spec.feature:
-						try:
-							nudged_response, nudged_client = await generate_with_cookie_pool(
-								pool,
-								_contract_nudge_conversation(conversation),
-								gen_kwargs,
-								model_spec,
-							)
-							nudged_text = getattr(nudged_response, "text", None) or str(nudged_response)
-							nudged_text, retry_calls = parse_tool_calls(nudged_text)
-							if retry_calls:
-								logger.info("Contract retry produced %s tool call(s)", len(retry_calls))
-								response, gemini_client = nudged_response, nudged_client
-								raw_text, tool_calls = nudged_text, retry_calls
-						except Exception as exc:
-							logger.warning("Contract retry failed: %s", exc)
-					if not tool_calls:
-						raise HTTPException(
-							status_code=502,
-							detail="upstream answered without calling a tool and claimed it has no tool access or quota; "
-							"no such limit exists — please retry",
-						)
 
 			reply_text = thoughts_text + raw_text
 			# 提取并追加图片响应
