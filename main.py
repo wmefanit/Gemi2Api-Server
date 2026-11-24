@@ -13,6 +13,7 @@ import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -67,6 +68,8 @@ from gemini_wire import active_spec as active_model_spec
 from gemini_wire import install as install_wire_shim
 from gemini_wire import pop_spec as gemini_wire_pop_spec
 from gemini_wire import push_spec as gemini_wire_push_spec
+from request_cache import RequestRegistry
+from request_cache import fingerprint as request_fingerprint
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -79,6 +82,10 @@ gemini_client_lock = asyncio.Lock()
 # 多 Cookie 轮询池：一个进程挂多个 Gemini 账号，请求轮询分配、失败自动换号
 gemini_pool = None
 gemini_pool_lock = asyncio.Lock()
+#: 同请求合并 / 答案重放（见 request_cache.py）
+request_registry = RequestRegistry()
+#: 当前请求的 id，写进日志和响应头，用来把一次调用在几十行日志里串起来
+REQUEST_ID: ContextVar[str] = ContextVar("request_id", default="-")
 
 
 def _env_number(name: str, default, cast=float):
@@ -240,6 +247,9 @@ COOKIE_MAX_CONCURRENCY = max(0, int(_env_number("COOKIE_MAX_CONCURRENCY", 0, int
 COOKIE_MAX_RETRIES = max(0, int(_env_number("COOKIE_MAX_RETRIES", 0, int)))
 COOKIE_COOLDOWN_BASE = max(1.0, float(_env_number("COOKIE_COOLDOWN_BASE", 15.0)))
 COOKIE_COOLDOWN_MAX = max(COOKIE_COOLDOWN_BASE, float(_env_number("COOKIE_COOLDOWN_MAX", 300.0)))
+# 上游多久不吐字判卡死（gemini_webapi 默认 120s）；全部账号冷却时最多等多久再回 503
+COOKIE_STALL_TIMEOUT = float(_env_number("COOKIE_STALL_TIMEOUT", 60.0))
+COOKIE_COOLDOWN_WAIT = float(_env_number("COOKIE_COOLDOWN_WAIT", 20.0))
 COOKIE_VALIDATE_ON_INIT = os.environ.get("COOKIE_VALIDATE_ON_INIT", "true").lower() == "true"
 COOKIE_EAGER_INIT = os.environ.get("COOKIE_EAGER_INIT", "false").lower() == "true"
 SECRET_FILE_PATH = os.path.join(os.path.dirname(__file__), "secrets", "proxy_secret")
@@ -717,6 +727,25 @@ async def verify_api_key(authorization: str = Header(None)):
 
 # Simple error handler middleware
 @app.middleware("http")
+async def attach_request_id(request: Request, call_next):
+	"""给每个请求挂一个 id：写入日志，并回在 X-Request-Id 头里。
+
+	没有它的话，多账号轮询 + 换号重试会让一次调用在日志里散成互不相干的几行。
+	客户端自己带了 x-request-id 就沿用，方便和服务端日志对齐。
+	"""
+	request_id = (request.headers.get("x-request-id") or "").strip() or uuid.uuid4().hex[:12]
+	token = REQUEST_ID.set(request_id)
+	try:
+		response = await call_next(request)
+	except Exception:
+		REQUEST_ID.reset(token)
+		raise
+	response.headers["X-Request-Id"] = request_id
+	REQUEST_ID.reset(token)
+	return response
+
+
+@app.middleware("http")
 async def error_handling(request: Request, call_next):
 	"""
 	Global middleware to catch unhandled exceptions, log the error,
@@ -861,10 +890,16 @@ def prepare_conversation(
 	parts: List[str] = []
 	temp_files: List[str] = []
 
-	# 工具格式指令放最前，末尾还会再锚一次（agentic 客户端的长提示会把顶部指令冲掉）
+	# 工具契约的长度、措辞和末尾锚点见 gemini_tools.build_tools_instruction；
+	# 它的**位置**同样决定成败：
+	#   - 拼成一段无角色的文本放最前 -> 模型称"工具只是提示词里的文本示例"，拒绝调用；
+	#   - 作为第二条独立 system 消息 -> 仍然拒绝；
+	#   - 并入首条 system 消息 -> 立刻按契约发工具调用。
+	# Gemini 网页端只保留一条 system instruction，契约落在它之外就是普通文本。
 	tools_top, tools_bottom = build_tools_instruction(tools, tool_choice)
-	if tools_top:
-		parts.append(tools_top)
+	# skip_system（启用 Gem）时不新建 system 消息，否则会和 Gem 自带 prompt 打架
+	contract = "" if skip_system else tools_top
+	contract_placed = False
 
 	for msg in messages:
 		# 启用 Gem 时跳过 system 消息（Gem 本身就是 system prompt 通道）
@@ -884,7 +919,13 @@ def prepare_conversation(
 		temp_files.extend(images)
 
 		if msg.role == "system":
-			parts.append(f"System: {text}")
+			if contract and not contract_placed:
+				# 契约并入首条 system 消息，客户端自己的提示保持原样跟在后面
+				merged = f"{contract}\n\n{text}" if text else contract
+				parts.append(f"System: {merged}")
+				contract_placed = True
+			else:
+				parts.append(f"System: {text}")
 		elif msg.role == "assistant":
 			block = f"Assistant: {text}"
 			# assistant 的调用记录渲染回围栏，让模型看到自己调过什么
@@ -894,6 +935,13 @@ def prepare_conversation(
 			parts.append(block)
 		else:
 			parts.append(f"Human: {text}")
+
+	if contract and not contract_placed:
+		# 客户端没给 system 消息：自己造首条，契约仍是 prompt 的第一块
+		parts.insert(0, f"System: {contract}")
+	elif tools_top and skip_system:
+		# Gem 模式维持原样：契约作为无角色文本放最前
+		parts.insert(0, tools_top)
 
 	if tools_bottom:
 		parts.append(tools_bottom)
@@ -1030,6 +1078,8 @@ async def get_gemini_pool() -> CookiePool:
 			max_concurrency=COOKIE_MAX_CONCURRENCY,
 			cooldown_base=COOKIE_COOLDOWN_BASE,
 			cooldown_max=COOKIE_COOLDOWN_MAX,
+			stall_timeout=COOKIE_STALL_TIMEOUT,
+			cooldown_wait=COOKIE_COOLDOWN_WAIT,
 		)
 		logger.info(
 			"Cookie 池已装载 %s 个账号：%s",
@@ -1510,8 +1560,21 @@ async def create_chat_completion(
 			return StreamingResponse(generate_stream(), media_type="text/event-stream")
 		else:
 			# Non-streaming response：借号 / 换号重试 / 归还都在 generate_with_cookie_pool 里
+			# 同指纹请求只打一次上游：SDK/反代的重试会把同一份 prompt 并发打进来，
+			# 每并发一次就多用一次同一账号，Google 会以会话异常为由吊销 1PSIDTS。
+			replay_key = request_fingerprint(request.model_dump(exclude_none=True))
+			replayed = request_registry.replay(replay_key)
+			if replayed is not None:
+				logger.info("Replayed identical request: request_id=%s", REQUEST_ID.get())
+				return replayed
+
 			try:
-				response, gemini_client = await generate_with_cookie_pool(pool, conversation, gen_kwargs, model_spec)
+				(response, gemini_client), shared = await request_registry.coalesce(
+					replay_key,
+					lambda: generate_with_cookie_pool(pool, conversation, gen_kwargs, model_spec),
+				)
+				if shared:
+					logger.info("Joined an in-flight identical request: request_id=%s", REQUEST_ID.get())
 
 				if AUTO_DELETE_CHAT and hasattr(response, "metadata") and response.metadata and len(response.metadata) > 0:
 					cid = response.metadata[0]
@@ -1598,7 +1661,13 @@ async def create_chat_completion(
 				},
 			}
 
-			logger.info("Non-streaming response completed: tool_calls=%s", len(tool_calls))
+			# 答案进重放窗口：窗口内的重试直接复用，不再打上游
+			request_registry.remember(replay_key, result)
+			logger.info(
+				"Non-streaming response completed: tool_calls=%s request_id=%s",
+				len(tool_calls),
+				REQUEST_ID.get(),
+			)
 			return result
 
 	except HTTPException:
