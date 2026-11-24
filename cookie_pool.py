@@ -159,6 +159,11 @@ AUTH_FAILURE_HINTS = (
 	"login required",
 	"session expired",
 	"invalid cookie",
+	# Gemini 网页端实际会返回 Permission denied (UNAUTHENTICATED)：这条以前没在表里，
+	# 于是真失效的会话既没被丢弃、也没进长冷却，下一轮还拿它去撞。
+	"unauthenticated",
+	"could not authenticate",
+	"authentication failed",
 )
 
 
@@ -499,8 +504,10 @@ class CookiePool:
 				client = await self._ensure_client(slot)
 			except Exception as e:
 				errors.append(f"{slot.entry.name}: {e}")
-				# 初始化/校验失败 = 这份 cookie 有问题，直接降级长冷却
-				self.report_failure(slot, e, permanent=True)
+				# 只有「cookie 确实失效」才配长冷却。握手超时、SSL 中断这类抖动按普通
+				# 退避处理：之前一律 permanent=True，一次 curl(35) 就让账号冷 300s，
+				# 表现为服务莫名其妙整体 503 五分钟，而账号其实完全正常。
+				self.report_failure(slot, e, permanent=looks_like_auth_failure(str(e)))
 				continue
 			slot.inflight += 1
 			slot.last_used = time.time()

@@ -97,3 +97,43 @@ def test_acquire_fails_fast_when_cooldown_longer_than_wait():
 
 	elapsed = asyncio.run(run())
 	assert elapsed < 0.3, elapsed
+
+
+def test_transient_init_error_uses_short_cooldown(monkeypatch):
+	"""握手抖动（curl 35）不该把账号冻 300s——之前 permanent 一律 True 就是这样。"""
+
+	class _SslBlip(_UpstreamDefaults):
+		async def init(self, timeout=None, **kwargs):
+			raise RuntimeError(
+				"Failed to perform, curl: (35) BoringSSL SSL_connect: Connection closed abruptly"
+			)
+
+	monkeypatch.setattr(cookie_pool, "GeminiClient", _SslBlip)
+	pool = _pool(cooldown_wait=0.0)
+
+	async def run():
+		with pytest.raises(CookiePoolUnavailable):
+			await pool.acquire()
+
+	asyncio.run(run())
+	slot = pool.slots[0]
+	remaining = slot.cooldown_until - time.time()
+	assert slot.failures == 1
+	assert remaining <= pool.cooldown_base + 1, remaining
+
+
+def test_auth_failure_still_gets_long_cooldown(monkeypatch):
+	class _AuthDead(_UpstreamDefaults):
+		async def init(self, timeout=None, **kwargs):
+			raise RuntimeError("Error: Authentication failed (UNAUTHENTICATED)")
+
+	monkeypatch.setattr(cookie_pool, "GeminiClient", _AuthDead)
+	pool = _pool(cooldown_wait=0.0)
+
+	async def run():
+		with pytest.raises(CookiePoolUnavailable):
+			await pool.acquire()
+
+	asyncio.run(run())
+	slot = pool.slots[0]
+	assert slot.cooldown_until - time.time() > 60
