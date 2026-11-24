@@ -159,6 +159,11 @@ AUTH_FAILURE_HINTS = (
 	"login required",
 	"session expired",
 	"invalid cookie",
+	# Gemini 网页端实际会返回 Permission denied (UNAUTHENTICATED)：这条以前没在表里，
+	# 于是真失效的会话既没被丢弃、也没进长冷却，下一轮还拿它去撞。
+	"unauthenticated",
+	"could not authenticate",
+	"authentication failed",
 )
 
 
@@ -406,10 +411,13 @@ class CookiePool:
 		validator: Optional[Callable[[GeminiClient, str], Any]] = None,
 		psidts_cache: Optional[Callable[[str], str]] = None,
 		extra_cookies: Optional[Dict[str, str]] = None,
+		proxy: Optional[str] = None,
 		max_concurrency: int = 0,
 		cooldown_base: float = 15.0,
 		cooldown_max: float = 300.0,
 		init_timeout: float = 300.0,
+		stall_timeout: float = 60.0,
+		cooldown_wait: float = 20.0,
 		degrade_after: int = 3,
 	):
 		self.slots: List[ClientSlot] = [ClientSlot(entry, index) for index, entry in enumerate(entries)]
@@ -417,10 +425,26 @@ class CookiePool:
 		self.validator = validator
 		self.psidts_cache = psidts_cache
 		self.extra_cookies = {k: v for k, v in (extra_cookies or {}).items() if k and v}
+		# 出口代理：直连打多了 Google 会按 IP 拦（temporarily flagged），SOCKS5 用 socks5h://
+		self.proxy = (proxy or "").strip() or None
+		if self.proxy:
+			# 代理在内网时，库里的 CurlFollow.SAFE 会把代理本身判成 SSRF，见 proxy_compat
+			from proxy_compat import relax_safe_redirects
+
+			patched = relax_safe_redirects()
+			logger.info("出口代理 %s 已启用，放宽 %s 个模块的 SAFE 重定向检查", self.proxy, patched)
 		self.max_concurrency = max(0, int(max_concurrency))
 		self.cooldown_base = max(1.0, float(cooldown_base))
 		self.cooldown_max = max(self.cooldown_base, float(cooldown_max))
 		self.init_timeout = float(init_timeout)
+		# 上游多久不吐字就判卡死。gemini_webapi 默认 timeout=450、watchdog_timeout=120，
+		# recovery 轮询上限取两者较小值——等于说一次卡顿能占住请求 120s 才报错，
+		# 这期间账号被冷却、同账号的其它请求全被 503 挡回去。客户端并发起来根本
+		# 不会为此降速，所以只能由服务端把等待预算压小、让失败快点返回。
+		self.stall_timeout = float(stall_timeout)
+		# 全部账号都在冷却时，最多等最近的那个到期再借，而不是立刻 503。
+		# 单账号部署下冷却 15s 内所有请求都会失败，客户端看到的就是「服务挂了」。
+		self.cooldown_wait = max(0.0, float(cooldown_wait))
 		# 连续失败这么多轮的账号降级为「兜底号」：只有别的号都不可用才轮到它
 		self.degrade_after = max(1, int(degrade_after))
 
@@ -462,17 +486,28 @@ class CookiePool:
 
 		skipped: Set[str] = set(exclude or set())
 		errors: List[str] = []
-		for _ in range(len(self.slots)):
+		waited = False
+		for _ in range(len(self.slots) * 2):
 			slot = self._pick(skipped)
 			if slot is None:
+				# 全在冷却：等最近的一个解冻再借（只等一次），别把冷却期变成 503 风暴
+				if not waited and self.cooldown_wait > 0:
+					gap = self._next_cooldown_gap(skipped)
+					if gap is not None and gap <= self.cooldown_wait:
+						waited = True
+						logger.info("全部账号冷却中，等待 %.1fs 后重试取号", gap)
+						await asyncio.sleep(gap + 0.05)
+						continue
 				break
 			skipped.add(slot.entry.psid)
 			try:
 				client = await self._ensure_client(slot)
 			except Exception as e:
 				errors.append(f"{slot.entry.name}: {e}")
-				# 初始化/校验失败 = 这份 cookie 有问题，直接降级长冷却
-				self.report_failure(slot, e, permanent=True)
+				# 只有「cookie 确实失效」才配长冷却。握手超时、SSL 中断这类抖动按普通
+				# 退避处理：之前一律 permanent=True，一次 curl(35) 就让账号冷 300s，
+				# 表现为服务莫名其妙整体 503 五分钟，而账号其实完全正常。
+				self.report_failure(slot, e, permanent=looks_like_auth_failure(str(e)))
 				continue
 			slot.inflight += 1
 			slot.last_used = time.time()
@@ -519,15 +554,21 @@ class CookiePool:
 				client = None
 				try:
 					logger.info("初始化账号 %s（%s 1PSIDTS）", slot.entry.name, source)
-					client = GeminiClient(slot.entry.psid, psidts)
+					client = GeminiClient(slot.entry.psid, psidts, proxy=self.proxy)
 					if self.extra_cookies:
 						# 整段 Cookie 里的 OSID / __Secure-OSID / SID 等：多账号会话靠它们选中登录态
 						client.cookies = self.extra_cookies
-					await client.init(timeout=self.init_timeout)
+					# gemini_webapi 只在 init 成功后才使用 timeout，init 本身卡住（如握手/重定向挂起）时会无限等待，
+					# 这里在外层兜一个总超时，超时按普通初始化失败处理，继续尝试下一个 1PSIDTS 来源。
+					try:
+						await asyncio.wait_for(client.init(timeout=self.init_timeout), timeout=self.init_timeout)
+					except asyncio.TimeoutError as te:
+						raise TimeoutError(f"client.init 超过 {self.init_timeout:.0f}s 未完成") from te
 					if self.install_shim is not None:
 						self.install_shim(client)
 					if self.validator is not None:
 						await self.validator(client, f"cookie-pool:{slot.entry.name}:{source}")
+					self._apply_stall_budget(client)
 					slot.client = client
 					slot.cooldown_until = 0.0
 					slot.last_error = ""
@@ -548,6 +589,32 @@ class CookiePool:
 				await self._ensure_client(slot)
 			except Exception as e:
 				logger.warning("预热账号 %s 失败：%s", slot.entry.name, e)
+
+	def _apply_stall_budget(self, client: GeminiClient) -> None:
+		"""把「上游多久不吐字算卡死」压到 stall_timeout。
+
+		gemini_webapi 的 recovery 轮询上限取 ``min(timeout, watchdog_timeout)``，
+		默认 120s。客户端不会因为服务端慢就少发请求，所以这个上限必须由我们自己
+		收紧，否则一次上游卡顿 = 一个账号被占住两分钟 + 随后一段冷却。
+		"""
+		if self.stall_timeout <= 0:
+			return
+		for attr in ("timeout", "watchdog_timeout"):
+			current = getattr(client, attr, None)
+			if isinstance(current, (int, float)) and current > self.stall_timeout:
+				setattr(client, attr, self.stall_timeout)
+
+	def _next_cooldown_gap(self, exclude: Set[str]) -> Optional[float]:
+		"""还要等多久才有账号解冻；没有任何账号时返回 None。"""
+		now = time.time()
+		gaps = [
+			slot.cooldown_until - now
+			for slot in self.slots
+			if slot.entry.psid not in exclude
+		]
+		if not gaps:
+			return None
+		return max(0.0, min(gaps))
 
 	def report_success(self, slot: ClientSlot) -> None:
 		"""这个账号这次成功了：清空失败计数和冷却。"""
