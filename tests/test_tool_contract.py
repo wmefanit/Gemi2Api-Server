@@ -1,10 +1,13 @@
-"""工具契约的注入位置与话术检测。
+"""工具契约的注入位置与文案约束。
 
 真号实测（Gemini Web，同一组工具、同一句契约）：
 拼在用户回合里 -> 模型称"工具只是提示词里的文本示例"，拒绝调用；
 作为独立 system 消息 -> 仍然拒绝；
 并入首条 system 消息 -> 立刻发出工具调用。
 Gemini 网页端只保留一条 system instruction，契约落在它之外就只是普通文本。
+
+拒答只在提示词层治理：没有关键词匹配、没有补问重试。所以这里的用例盯的是
+「契约文案必须包含哪几条硬约束」，删掉任何一条都会被这里挡住。
 """
 
 import gemini_tools as gt
@@ -67,17 +70,32 @@ def test_bottom_anchor_stays_last():
 
 
 # ---------------------------------------------------------------------------
-# 话术检测
+# 契约文案的硬约束（拒答治理全部落在这几条上）
 # ---------------------------------------------------------------------------
 
 
-def test_quota_claim_detected():
-	assert gt.looks_like_tool_quota_claim("工具调用额度已锁死（剩余 0 次），请提供更多额度")
-	assert gt.looks_like_tool_quota_claim("You have 0 tool calls left.")
-	assert not gt.looks_like_tool_quota_claim("已执行 ls -la，输出如下：")
+def test_bottom_anchor_forbids_refusing_and_invented_quota():
+	_top, bottom = gt.build_tools_instruction(TOOLS)
+	# 工具真实存在、由服务端执行
+	assert "executed by the server" in bottom
+	# 不存在调用额度/计数器
+	assert "no quota, no counter" in bottom
+	# 需要工具时不许解释式拒答
+	assert "Never refuse on your own" in bottom
+	# 不需要工具时才允许散文回答，且不许提工具
+	assert "needs no tool at all" in bottom
 
 
-def test_unavailable_claim_detected():
-	assert gt.looks_like_tool_unavailable_claim("我无法访问文件系统，请把内容贴给我")
-	assert gt.looks_like_tool_unavailable_claim("I don't have access to the terminal.")
-	assert not gt.looks_like_tool_unavailable_claim("文件已读取，内容是 hello")
+def test_bottom_anchor_demands_single_fence_and_warns_off_plain_code_block():
+	_top, bottom = gt.build_tools_instruction(TOOLS)
+	assert "exactly ONE" in bottom
+	assert "NOT executed" in bottom
+
+
+def test_forced_tool_contract_keeps_its_name():
+	top, _bottom = gt.build_tools_instruction(TOOLS, {"type": "function", "function": {"name": "run_command"}})
+	assert 'MUST call the tool "run_command"' in top
+
+
+def test_tool_choice_none_drops_contract():
+	assert gt.build_tools_instruction(TOOLS, "none") == ("", "")
