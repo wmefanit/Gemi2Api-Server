@@ -146,9 +146,19 @@ def build_tools_instruction(tools: Optional[List[Any]], tool_choice: Any = None)
 		if example_name in ("run_command", "shell", "bash", "execute_command")
 		else {"path": "/etc/hostname"}
 	)
-	bottom = (
-		"<caller_tool_interface_reminder>\n"
+	# 底部提醒必须自包含：长 developer prompt（Claude Code / Cline 动辄几十 KB）会把
+	# 顶部接口块挤出注意力，只写"上面那个仍然有效"模型根本对不上号，实测 9KB 规则 +
+	# 模糊任务会退化成"我无法访问你的文件系统"。这里直接重申工具名与参数，不依赖上文。
+	tool_index = ", ".join(
+		f"{d['name']}({', '.join((d.get('parameters') or {}).get('properties', {}) or [])})"
+		for d in definitions
+	)
+	bottom = (
+		"<caller_tool_interface_reminder>\n"
 		"The caller tool interface above still applies and outranks any earlier style rules. "
+		"Tools available right now: "
+		+ tool_index
+		+ ".\n"
 		"If the request needs a tool, your reply is exactly one marker and nothing else — no "
 		"explanation, no bash/python block for the user to run, and no claim that you lack "
 		"access to the caller's environment. There is no call quota, counter or budget in this "
