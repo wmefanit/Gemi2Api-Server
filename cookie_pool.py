@@ -406,6 +406,7 @@ class CookiePool:
 		validator: Optional[Callable[[GeminiClient, str], Any]] = None,
 		psidts_cache: Optional[Callable[[str], str]] = None,
 		extra_cookies: Optional[Dict[str, str]] = None,
+		proxy: Optional[str] = None,
 		max_concurrency: int = 0,
 		cooldown_base: float = 15.0,
 		cooldown_max: float = 300.0,
@@ -417,6 +418,14 @@ class CookiePool:
 		self.validator = validator
 		self.psidts_cache = psidts_cache
 		self.extra_cookies = {k: v for k, v in (extra_cookies or {}).items() if k and v}
+		# 出口代理：直连打多了 Google 会按 IP 拦（temporarily flagged），SOCKS5 用 socks5h://
+		self.proxy = (proxy or "").strip() or None
+		if self.proxy:
+			# 代理在内网时，库里的 CurlFollow.SAFE 会把代理本身判成 SSRF，见 proxy_compat
+			from proxy_compat import relax_safe_redirects
+
+			patched = relax_safe_redirects()
+			logger.info("出口代理 %s 已启用，放宽 %s 个模块的 SAFE 重定向检查", self.proxy, patched)
 		self.max_concurrency = max(0, int(max_concurrency))
 		self.cooldown_base = max(1.0, float(cooldown_base))
 		self.cooldown_max = max(self.cooldown_base, float(cooldown_max))
@@ -519,7 +528,7 @@ class CookiePool:
 				client = None
 				try:
 					logger.info("初始化账号 %s（%s 1PSIDTS）", slot.entry.name, source)
-					client = GeminiClient(slot.entry.psid, psidts)
+					client = GeminiClient(slot.entry.psid, psidts, proxy=self.proxy)
 					if self.extra_cookies:
 						# 整段 Cookie 里的 OSID / __Secure-OSID / SID 等：多账号会话靠它们选中登录态
 						client.cookies = self.extra_cookies

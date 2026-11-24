@@ -1091,6 +1091,7 @@ async def get_gemini_pool() -> CookiePool:
 			validator=validate_gemini_client_session if COOKIE_VALIDATE_ON_INIT else None,
 			psidts_cache=load_cached_1psidts,
 			extra_cookies=load_extra_cookies(),
+			proxy=os.environ.get("GEMINI_PROXY") or None,
 			max_concurrency=COOKIE_MAX_CONCURRENCY,
 			cooldown_base=COOKIE_COOLDOWN_BASE,
 			cooldown_max=COOKIE_COOLDOWN_MAX,
@@ -1290,6 +1291,13 @@ async def create_chat_completion(
 			tool_choice=request.tool_choice,
 		)
 		tools_active = bool(build_tools_instruction(request.tools, request.tool_choice)[0])
+		if os.environ.get("GEMI_DEBUG_PROMPT"):
+			logger.info(
+				"PROMPT_HEAD=%r PROMPT_TAIL=%r LEN=%s",
+				conversation[:400],
+				conversation[-400:],
+				len(conversation),
+			)
 		logger.info(
 			"Chat completion request: stream=%s requested_model=%s messages=%s temp_files=%s tools=%s",
 			request.stream,
