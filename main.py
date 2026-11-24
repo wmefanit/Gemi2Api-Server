@@ -1634,7 +1634,7 @@ async def create_chat_completion(
 						status_code=502,
 						detail="upstream reply had only an unparseable tool_call block; please retry",
 					)
-					raw_text = clean_text
+				raw_text = clean_text
 
 			reply_text = thoughts_text + raw_text
 			# 提取并追加图片响应
