@@ -28,8 +28,14 @@ url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
 
 [dependency-groups]
 dev = [
-    "ruff>=0.15.6",
+	"ruff>=0.15.6",
+	"pytest>=8.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
 
 [tool.ruff]
 line-length = 150  # 设置最大行长度
