@@ -532,7 +532,12 @@ class CookiePool:
 					if self.extra_cookies:
 						# 整段 Cookie 里的 OSID / __Secure-OSID / SID 等：多账号会话靠它们选中登录态
 						client.cookies = self.extra_cookies
-					await client.init(timeout=self.init_timeout)
+					# gemini_webapi 只在 init 成功后才使用 timeout，init 本身卡住（如握手/重定向挂起）时会无限等待，
+					# 这里在外层兜一个总超时，超时按普通初始化失败处理，继续尝试下一个 1PSIDTS 来源。
+					try:
+						await asyncio.wait_for(client.init(timeout=self.init_timeout), timeout=self.init_timeout)
+					except asyncio.TimeoutError as te:
+						raise TimeoutError(f"client.init 超过 {self.init_timeout:.0f}s 未完成") from te
 					if self.install_shim is not None:
 						self.install_shim(client)
 					if self.validator is not None:
