@@ -247,6 +247,9 @@ COOKIE_MAX_CONCURRENCY = max(0, int(_env_number("COOKIE_MAX_CONCURRENCY", 0, int
 COOKIE_MAX_RETRIES = max(0, int(_env_number("COOKIE_MAX_RETRIES", 0, int)))
 COOKIE_COOLDOWN_BASE = max(1.0, float(_env_number("COOKIE_COOLDOWN_BASE", 15.0)))
 COOKIE_COOLDOWN_MAX = max(COOKIE_COOLDOWN_BASE, float(_env_number("COOKIE_COOLDOWN_MAX", 300.0)))
+# 上游多久不吐字判卡死（gemini_webapi 默认 120s）；全部账号冷却时最多等多久再回 503
+COOKIE_STALL_TIMEOUT = float(_env_number("COOKIE_STALL_TIMEOUT", 60.0))
+COOKIE_COOLDOWN_WAIT = float(_env_number("COOKIE_COOLDOWN_WAIT", 20.0))
 COOKIE_VALIDATE_ON_INIT = os.environ.get("COOKIE_VALIDATE_ON_INIT", "true").lower() == "true"
 COOKIE_EAGER_INIT = os.environ.get("COOKIE_EAGER_INIT", "false").lower() == "true"
 SECRET_FILE_PATH = os.path.join(os.path.dirname(__file__), "secrets", "proxy_secret")
@@ -1075,6 +1078,8 @@ async def get_gemini_pool() -> CookiePool:
 			max_concurrency=COOKIE_MAX_CONCURRENCY,
 			cooldown_base=COOKIE_COOLDOWN_BASE,
 			cooldown_max=COOKIE_COOLDOWN_MAX,
+			stall_timeout=COOKIE_STALL_TIMEOUT,
+			cooldown_wait=COOKIE_COOLDOWN_WAIT,
 		)
 		logger.info(
 			"Cookie 池已装载 %s 个账号：%s",

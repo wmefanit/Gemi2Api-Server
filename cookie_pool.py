@@ -411,6 +411,8 @@ class CookiePool:
 		cooldown_base: float = 15.0,
 		cooldown_max: float = 300.0,
 		init_timeout: float = 300.0,
+		stall_timeout: float = 60.0,
+		cooldown_wait: float = 20.0,
 		degrade_after: int = 3,
 	):
 		self.slots: List[ClientSlot] = [ClientSlot(entry, index) for index, entry in enumerate(entries)]
@@ -430,6 +432,14 @@ class CookiePool:
 		self.cooldown_base = max(1.0, float(cooldown_base))
 		self.cooldown_max = max(self.cooldown_base, float(cooldown_max))
 		self.init_timeout = float(init_timeout)
+		# 上游多久不吐字就判卡死。gemini_webapi 默认 timeout=450、watchdog_timeout=120，
+		# recovery 轮询上限取两者较小值——等于说一次卡顿能占住请求 120s 才报错，
+		# 这期间账号被冷却、同账号的其它请求全被 503 挡回去。客户端并发起来根本
+		# 不会为此降速，所以只能由服务端把等待预算压小、让失败快点返回。
+		self.stall_timeout = float(stall_timeout)
+		# 全部账号都在冷却时，最多等最近的那个到期再借，而不是立刻 503。
+		# 单账号部署下冷却 15s 内所有请求都会失败，客户端看到的就是「服务挂了」。
+		self.cooldown_wait = max(0.0, float(cooldown_wait))
 		# 连续失败这么多轮的账号降级为「兜底号」：只有别的号都不可用才轮到它
 		self.degrade_after = max(1, int(degrade_after))
 
@@ -471,9 +481,18 @@ class CookiePool:
 
 		skipped: Set[str] = set(exclude or set())
 		errors: List[str] = []
-		for _ in range(len(self.slots)):
+		waited = False
+		for _ in range(len(self.slots) * 2):
 			slot = self._pick(skipped)
 			if slot is None:
+				# 全在冷却：等最近的一个解冻再借（只等一次），别把冷却期变成 503 风暴
+				if not waited and self.cooldown_wait > 0:
+					gap = self._next_cooldown_gap(skipped)
+					if gap is not None and gap <= self.cooldown_wait:
+						waited = True
+						logger.info("全部账号冷却中，等待 %.1fs 后重试取号", gap)
+						await asyncio.sleep(gap + 0.05)
+						continue
 				break
 			skipped.add(slot.entry.psid)
 			try:
@@ -542,6 +561,7 @@ class CookiePool:
 						self.install_shim(client)
 					if self.validator is not None:
 						await self.validator(client, f"cookie-pool:{slot.entry.name}:{source}")
+					self._apply_stall_budget(client)
 					slot.client = client
 					slot.cooldown_until = 0.0
 					slot.last_error = ""
@@ -562,6 +582,32 @@ class CookiePool:
 				await self._ensure_client(slot)
 			except Exception as e:
 				logger.warning("预热账号 %s 失败：%s", slot.entry.name, e)
+
+	def _apply_stall_budget(self, client: GeminiClient) -> None:
+		"""把「上游多久不吐字算卡死」压到 stall_timeout。
+
+		gemini_webapi 的 recovery 轮询上限取 ``min(timeout, watchdog_timeout)``，
+		默认 120s。客户端不会因为服务端慢就少发请求，所以这个上限必须由我们自己
+		收紧，否则一次上游卡顿 = 一个账号被占住两分钟 + 随后一段冷却。
+		"""
+		if self.stall_timeout <= 0:
+			return
+		for attr in ("timeout", "watchdog_timeout"):
+			current = getattr(client, attr, None)
+			if isinstance(current, (int, float)) and current > self.stall_timeout:
+				setattr(client, attr, self.stall_timeout)
+
+	def _next_cooldown_gap(self, exclude: Set[str]) -> Optional[float]:
+		"""还要等多久才有账号解冻；没有任何账号时返回 None。"""
+		now = time.time()
+		gaps = [
+			slot.cooldown_until - now
+			for slot in self.slots
+			if slot.entry.psid not in exclude
+		]
+		if not gaps:
+			return None
+		return max(0.0, min(gaps))
 
 	def report_success(self, slot: ClientSlot) -> None:
 		"""这个账号这次成功了：清空失败计数和冷却。"""
