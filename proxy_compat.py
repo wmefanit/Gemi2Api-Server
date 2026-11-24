@@ -1,13 +1,14 @@
 """让 gemini-webapi 能在 SOCKS 代理后面工作。
 
 gemini_webapi 在取 access token / 下载图片时写死了 ``allow_redirects=CurlFollow.SAFE``。
-SAFE 是 curl_cffi 的 SSRF 防护：目标解析到内网地址就拒绝。国内常用出口恰好是一个内网地址的
-SOCKS5（例如 docker 网桥里 172.17.0.11:1083 的 mihomo），代理自己就在私网，于是每个请求都被
-判成 SSRF：
+SAFE 是 curl_cffi 的 SSRF 防护：跟随重定向时，如果实际连上的地址是内网地址就拒绝。走代理时
+「实际连上的地址」是代理本身；代理一旦部署在内网（例如 ub.host:1083 解析到 docker 网桥里的
+172.17.0.11），任何一次跨主机跳转都会被判成 SSRF，不跳转的请求则不受影响：
 
     curl: (7) Redirect to internal IP 172.17.0.11 rejected (SSRF protection)
 
-这不是配置错误，本地端口转发也救不了（转发目标仍是那个私网 IP），只能在进程内把 SAFE 放宽成
+这不是代理配置错误，本地端口转发也救不了（连上的仍是私网地址）；SAFE 只是一个开关，不能给代理
+地址开白名单，只能在进程内把 SAFE 放宽成
 普通跟随重定向。仅在配置了代理时才放宽，没配代理时保留库的默认防护。
 """
 
