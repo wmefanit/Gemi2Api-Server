@@ -56,8 +56,6 @@ from gemini_models import (
 )
 from gemini_task import ensure_task_ready
 from gemini_tools import (
-	CONTRACT_CLOSE,
-	CONTRACT_OPEN,
 	TOOL_FENCE_CLOSE,
 	TOOL_FENCE_OPEN,
 	ToolFenceGate,
@@ -865,11 +863,6 @@ def get_effective_model_debug_info(spec: ModelSpec) -> Dict[str, str]:
 	}
 
 
-def _wrap_tool_contract(text: str) -> str:
-	"""用哨兵包住契约块，方便上层按字节剔除（存库/哈希时不该带上注入内容）。"""
-	return f"{CONTRACT_OPEN}\n{text}\n{CONTRACT_CLOSE}"
-
-
 # Prepare conversation history from OpenAI messages format
 def prepare_conversation(
 	messages: List[Message],
@@ -925,7 +918,7 @@ def prepare_conversation(
 		if msg.role == "system":
 			if contract and not contract_placed:
 				# 契约并入首条 system 消息，客户端自己的提示保持原样跟在后面
-				merged = f"{_wrap_tool_contract(contract)}\n\n{text}" if text else _wrap_tool_contract(contract)
+				merged = f"{contract}\n\n{text}" if text else contract
 				parts.append(f"System: {merged}")
 				contract_placed = True
 			else:
@@ -942,7 +935,7 @@ def prepare_conversation(
 
 	if contract and not contract_placed:
 		# 客户端没给 system 消息：自己造首条，契约仍是 prompt 的第一块
-		parts.insert(0, f"System: {_wrap_tool_contract(contract)}")
+		parts.insert(0, f"System: {contract}")
 	elif tools_top and skip_system:
 		# Gem 模式维持原样：契约作为无角色文本放最前
 		parts.insert(0, tools_top)
@@ -1079,7 +1072,6 @@ async def get_gemini_pool() -> CookiePool:
 			validator=validate_gemini_client_session if COOKIE_VALIDATE_ON_INIT else None,
 			psidts_cache=load_cached_1psidts,
 			extra_cookies=load_extra_cookies(),
-			proxy=os.environ.get("GEMINI_PROXY") or None,
 			max_concurrency=COOKIE_MAX_CONCURRENCY,
 			cooldown_base=COOKIE_COOLDOWN_BASE,
 			cooldown_max=COOKIE_COOLDOWN_MAX,
@@ -1279,13 +1271,6 @@ async def create_chat_completion(
 			tool_choice=request.tool_choice,
 		)
 		tools_active = bool(build_tools_instruction(request.tools, request.tool_choice)[0])
-		if os.environ.get("GEMI_DEBUG_PROMPT"):
-			logger.info(
-				"PROMPT_HEAD=%r PROMPT_TAIL=%r LEN=%s",
-				conversation[:400],
-				conversation[-400:],
-				len(conversation),
-			)
 		logger.info(
 			"Chat completion request: stream=%s requested_model=%s messages=%s temp_files=%s tools=%s",
 			request.stream,

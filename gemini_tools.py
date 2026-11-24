@@ -30,10 +30,6 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 TOOL_FENCE_OPEN = "```tool_call"
 TOOL_FENCE_CLOSE = "```"
 
-#: 契约块哨兵：注入位置会变，用哨兵包住才能在哈希/存储时整块剔除
-CONTRACT_OPEN = "<<<GATEWAY_TOOL_CONTRACT>>>"
-CONTRACT_CLOSE = "<<<END_GATEWAY_TOOL_CONTRACT>>>"
-
 #: 模型写工具名时用过的键
 TOOL_CALL_NAME_KEYS = ("name", "tool", "tool_name", "function_name")
 #: 模型写参数时用过的容器键，按优先级排：有多个时只取第一个能用的，不合并

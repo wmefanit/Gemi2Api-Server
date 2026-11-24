@@ -35,29 +35,30 @@ def test_contract_merges_into_first_system_message():
 		[main.Message(role="system", content="你是运维助手"), main.Message(role="user", content="列出目录")],
 		tools=TOOLS,
 	)
-	assert text.startswith("System: " + gt.CONTRACT_OPEN)
+	assert text.startswith("System: [System instruction]")
 	# 客户端自己的提示仍在同一条 system 消息里，契约在它之前
-	assert text.index(gt.CONTRACT_OPEN) < text.index("你是运维助手")
+	assert text.index("Available tools:") < text.index("你是运维助手")
+	# 契约不再用哨兵包裹：模型会把标记当成人贴的假文档
+	assert "GATEWAY_TOOL_CONTRACT" not in text
 	# 只有一条 system 块：契约没有被拆成第二条 system 消息
 	assert text.count("\nSystem: ") + text.count("System: ") == 1
 
 
 def test_contract_creates_leading_system_when_client_sends_none():
 	text = conversation([main.Message(role="user", content="列出目录")], tools=TOOLS)
-	assert text.startswith("System: " + gt.CONTRACT_OPEN)
+	assert text.startswith("System: [System instruction]")
 	assert "Human: 列出目录" in text
 
 
 def test_no_contract_without_tools():
 	text = conversation([main.Message(role="system", content="你是运维助手"), main.Message(role="user", content="你好")])
-	assert gt.CONTRACT_OPEN not in text
+	assert "Available tools:" not in text
 	assert text.startswith("System: 你是运维助手")
 
 
 def test_gem_mode_keeps_contract_out_of_system_message():
 	"""启用 Gem 时不新建 system 消息，否则和 Gem 自带 prompt 冲突。"""
 	text = conversation([main.Message(role="user", content="列出目录")], skip_system=True, tools=TOOLS)
-	assert gt.CONTRACT_OPEN not in text
 	assert text.startswith("[System instruction]")
 	assert "Human: 列出目录" in text
 
