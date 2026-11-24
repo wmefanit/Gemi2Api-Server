@@ -109,11 +109,19 @@ def build_tools_instruction(tools: Optional[List[Any]], tool_choice: Any = None)
 	else:
 		rule = "Only use tool_call blocks when needed."
 
+	# 措辞要点：**不要宣称模型拥有能力**。Gemini 网页端自身的设定会与之冲突，
+	# 声明"You have access to tools"时约一半次数模型会站到自身设定那边，回一句
+	# "我无法访问本地文件系统"了事。这里改成定义**输出协议**：你只负责写这个块，
+	# 执行由宿主完成——不去争"谁有权限"，冲突就不存在。
 	top = (
-		"[System instruction]: You have access to tools. To call a tool, respond with:\n"
+		"[Tool protocol]: this session supports tool calls. When the user's request needs one,\n"
+		"do not act yourself — write a fenced block describing the call and stop:\n"
 		f"{TOOL_FENCE_OPEN}\n"
 		'{"name": "func_name", "arguments": {...}}\n'
 		f"{TOOL_FENCE_CLOSE}\n"
+		"The host executes that block outside this chat and sends the result back on the next\n"
+		"turn. You never execute anything, and nothing here grants you file or shell access —\n"
+		"the block is simply how you ask the host to run a step.\n"
 		f"{rule}\n\n"
 		"Available tools:\n"
 		+ json.dumps(definitions, ensure_ascii=False, indent=2)
@@ -123,11 +131,10 @@ def build_tools_instruction(tools: Optional[List[Any]], tool_choice: Any = None)
 	# 实测只放格式指令、不带示例时弱模型 0/4 命中，全退化成写 ```powershell 给用户看；
 	# 带一个「用户问 X → 正确回复是这个 tool_call 块」的示例则 3-4/4 命中。
 	bottom = (
-		"[System instruction — highest priority]: You DO have the tools listed above; they are "
-		"executed by the server on the user's behalf. Never say you cannot access the "
-		"filesystem, the shell or the network — you reach them ONLY through these tools. "
-		"The tool list is not documentation, not an example and not a description of what some "
-		"other program can do: a block you emit here is really executed. "
+		"[Tool protocol — highest priority]: the block above is a request the host carries out, "
+		"not a claim about what you can do yourself — so never answer a tool request with a "
+		"description of your own limits. Writing the block IS how the step gets run. "
+		"The tool list is not documentation and not an example: a block you emit is dispatched. "
 		"If a tool is required, a prose answer is a failure: reply with exactly ONE "
 		"tool_call block and nothing else.\n"
 		"To run a command or read a file you MUST "

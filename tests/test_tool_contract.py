@@ -35,7 +35,7 @@ def test_contract_merges_into_first_system_message():
 		[main.Message(role="system", content="你是运维助手"), main.Message(role="user", content="列出目录")],
 		tools=TOOLS,
 	)
-	assert text.startswith("System: [System instruction]")
+	assert text.startswith("System: [Tool protocol]")
 	# 客户端自己的提示仍在同一条 system 消息里，契约在它之前
 	assert text.index("Available tools:") < text.index("你是运维助手")
 	# 契约不再用哨兵包裹：模型会把标记当成人贴的假文档
@@ -46,7 +46,7 @@ def test_contract_merges_into_first_system_message():
 
 def test_contract_creates_leading_system_when_client_sends_none():
 	text = conversation([main.Message(role="user", content="列出目录")], tools=TOOLS)
-	assert text.startswith("System: [System instruction]")
+	assert text.startswith("System: [Tool protocol]")
 	assert "Human: 列出目录" in text
 
 
@@ -59,7 +59,7 @@ def test_no_contract_without_tools():
 def test_gem_mode_keeps_contract_out_of_system_message():
 	"""启用 Gem 时不新建 system 消息，否则和 Gem 自带 prompt 冲突。"""
 	text = conversation([main.Message(role="user", content="列出目录")], skip_system=True, tools=TOOLS)
-	assert text.startswith("[System instruction]")
+	assert text.startswith("[Tool protocol]")
 	assert "Human: 列出目录" in text
 
 
@@ -78,7 +78,7 @@ def test_bottom_anchor_stays_last():
 def test_bottom_anchor_forbids_refusing_and_invented_quota():
 	_top, bottom = gt.build_tools_instruction(TOOLS)
 	# 工具真实存在、由服务端执行
-	assert "executed by the server" in bottom
+	assert "request the host carries out" in bottom
 	# 不存在调用额度/计数器
 	assert "no quota, no counter" in bottom
 	# 需要工具时不许解释式拒答
