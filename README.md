@@ -36,6 +36,7 @@ API_KEY= "API_KEY VALUE HERE"
 TEMPORARY_CHAT = "false" # 使用临时对话模式，此模式会禁用部分功能如思考、图片生成等，默认关闭。
 AUTO_DELETE_CHAT = "true" # 生成结束后自动从web端删除对话记录，默认开启。TEMPORARY_CHAT为true时，此项无效。
 PUBLIC_BASE_URL = "https://your-domain.com" # 外部URL，用于生成图片代理链接，不填则会使用内部地址。使用反向代理时必填，否则可能导致图片无法访问。
+GEMINI_PROXY = "socks5h://proxy.example:1080" # 可选：Gemini 上游出口代理；遇到 Google IP 临时拦截时可配置代理出口。
 CUSTOM_MODELS_FILE = "custom_models.yaml" # 可选。用于覆写/新增 Gemini 模型定义，支持 YAML/JSON。
 DISABLE_BUILTIN_MODELS = "true" # 可选。设为 true 时，/v1/models 仅返回 CUSTOM_MODELS(_FILE) 中定义的模型，不再追加 gemini_webapi 内置模型（仓库自带配置用 true，对外只有 5 条路由）。此开关在服务启动时读取，修改 .env 后需重启生效（区别于 CUSTOM_MODELS_FILE 的免重启热加载）；也可在管理面板「功能开关」中切换，即时生效并写回 .env。
 ```
@@ -140,14 +141,14 @@ g.a000xxxxx,1PSIDTS的值,号4
 | --- | --- | --- |
 | `COOKIE_MAX_CONCURRENCY` | `0` | 单个账号同时在途的请求上限，0 表示不限 |
 | `COOKIE_MAX_RETRIES` | `0` | 单次请求最多试几个账号，0 表示等于账号数量 |
-| `COOKIE_COOLDOWN_BASE` / `COOKIE_COOLDOWN_MAX` | `15` / `300` | 失败后的冷却退避区间（秒） |
+| `COOKIE_COOLDOWN_BASE` / `COOKIE_COOLDOWN_MAX` | `15` / `300` | 账号级失败的冷却退避区间（秒）；SSL/临时网络错误不冷却账号 |
 | `COOKIE_VALIDATE_ON_INIT` | `true` | 新号第一次使用时跑一遍「建会话 + 读回」探针 |
 | `COOKIE_EAGER_INIT` | `false` | 启动时预热全部账号（否则等流量打到才初始化） |
 
 行为说明：
 
 - **分配**：冷却中的号跳过；其余按（在途数, 上次使用时间）取最小，所以空闲号会被轮流用到，慢号也不会被压满。正在初始化的号按「忙」处理，并发请求不会排在它后面干等。
-- **失败冷却**：生成失败按 15s → 30s → 60s → … → 300s 退避；初始化/校验失败说明这份 cookie 本身坏了，直接打到降级阈值并给足最长冷却。
+- **失败冷却**：账号级失败按 15s → 30s → 60s → … → 300s 退避；明确的 SSL/TLS 握手失败和 Google `TemporarilyBlockedError` 属于出口/网络问题，不增加账号降级计数，也不冷却 Cookie 槽位，让后续请求可重新尝试（多出口代理可能分配到其他出口）。
 - **降级**：连续失败 3 次的号变成「兜底号」，只有别的号都不可用时才轮到它。
 - **重试**：非流式请求失败会自动换号重试（最多等于账号数）；流式请求会占住分配到的号直到流结束，中途不换号。
 - **观测**：管理面板 `/admin` 的服务状态里会列出每个号的在途数、成功/失败次数和剩余冷却（接口字段 `cookie_accounts`），日志里也会打印 `Cookie 池：账号 xxx 失败第 N 次，冷却 Ns`。账号池卡片还会显示该号套餐（FREE / PRO / ULTRA）和 5 小时 / 每周额度，点「刷新额度」可实时重新拉取（接口 `POST /admin/api/quota-refresh`）。

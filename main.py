@@ -39,6 +39,7 @@ from cookie_pool import (
 	CookieLease,
 	CookiePool,
 	CookiePoolUnavailable,
+	is_transient_network_failure,
 	load_cookie_entries,
 	load_extra_cookies,
 )
@@ -235,6 +236,7 @@ app.add_middleware(
 # Authentication credentials
 SECURE_1PSID = os.environ.get("SECURE_1PSID", "")
 SECURE_1PSIDTS = os.environ.get("SECURE_1PSIDTS", "")
+GEMINI_PROXY = (os.environ.get("GEMINI_PROXY") or "").strip() or None
 API_KEY = os.environ.get("API_KEY", "")
 ENABLE_THINKING = os.environ.get("ENABLE_THINKING", "false").lower() == "true"
 TEMPORARY_CHAT = os.environ.get("TEMPORARY_CHAT", "false").lower() == "true"
@@ -1075,7 +1077,7 @@ async def get_gemini_pool() -> CookiePool:
 			validator=validate_gemini_client_session if COOKIE_VALIDATE_ON_INIT else None,
 			psidts_cache=load_cached_1psidts,
 			extra_cookies=load_extra_cookies(),
-			proxy=os.environ.get("GEMINI_PROXY") or None,
+			proxy=GEMINI_PROXY,
 			max_concurrency=COOKIE_MAX_CONCURRENCY,
 			cooldown_base=COOKIE_COOLDOWN_BASE,
 			cooldown_max=COOKIE_COOLDOWN_MAX,
@@ -1161,7 +1163,7 @@ async def fetch_live_quota() -> Optional[Dict[str, Any]]:
 
 	from cookie_pool import load_extra_cookies, mask_email, quota_view
 
-	client = GeminiClient(SECURE_1PSID, SECURE_1PSIDTS)
+	client = GeminiClient(SECURE_1PSID, SECURE_1PSIDTS, proxy=GEMINI_PROXY)
 	try:
 		extras = load_extra_cookies()
 		if extras:
@@ -1277,13 +1279,6 @@ async def create_chat_completion(
 			tool_choice=request.tool_choice,
 		)
 		tools_active = bool(build_tools_instruction(request.tools, request.tool_choice)[0])
-		if os.environ.get("GEMI_DEBUG_PROMPT"):
-			logger.info(
-				"PROMPT_HEAD=%r PROMPT_TAIL=%r LEN=%s",
-				conversation[:400],
-				conversation[-400:],
-				len(conversation),
-			)
 		logger.info(
 			"Chat completion request: stream=%s requested_model=%s messages=%s temp_files=%s tools=%s",
 			request.stream,
@@ -1682,6 +1677,13 @@ async def create_chat_completion(
 		# 模型名不认识 / 已下线这类 4xx 直接透出，不要裹成 500
 		raise
 	except Exception as e:
+		if is_transient_network_failure(e):
+			logger.warning("Transient Gemini upstream failure; returning retryable 503: %s", e)
+			raise HTTPException(
+				status_code=503,
+				detail="Gemini 上游暂时不可用，请稍后重试。",
+				headers={"Retry-After": "30"},
+			) from e
 		logger.error(f"Error generating completion: {str(e)}", exc_info=True)
 		raise HTTPException(status_code=500, detail=f"Error generating completion: {str(e)}")
 
