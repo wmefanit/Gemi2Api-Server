@@ -19,7 +19,11 @@ TOOLS = [
 		"function": {
 			"name": "run_command",
 			"description": "run a shell command",
-			"parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+			"parameters": {
+				"type": "object",
+				"properties": {"command": {"type": "string"}},
+				"required": ["command"],
+			},
 		},
 	},
 ]
@@ -92,6 +96,112 @@ def test_bottom_anchor_demands_single_fence_and_warns_off_plain_code_block():
 	_top, bottom = gt.build_tools_instruction(TOOLS)
 	assert "exactly one marker" in bottom
 	assert "bash/python block" in bottom
+	assert "/etc/hostname" not in bottom
+	assert '"command": "ls -la"' in bottom
+
+	# Examples must contain valid required arguments and remain workspace-local.
+	read_only = [{
+		"type": "function",
+		"function": {
+			"name": "read_file",
+			"parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+		},
+	}]
+	_, read_bottom = gt.build_tools_instruction(read_only)
+	assert '"path": "README.md"' in read_bottom
+	assert '"arguments": {}' not in read_bottom
+
+	write_only = [{
+		"type": "function",
+		"function": {
+			"name": "write_file",
+			"parameters": {
+				"type": "object",
+				"properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+				"required": ["path", "content"],
+			},
+		},
+	}]
+	_, write_bottom = gt.build_tools_instruction(write_only)
+	assert '"name": "write_file"' not in write_bottom
+	assert "Do not issue a sample call" in write_bottom
+	assert "only with arguments grounded in the user's request" in write_bottom
+
+	# An optional-only schema still gets a small workspace-local example.
+	optional_read = [{
+		"type": "function",
+		"function": {
+			"name": "read_file",
+			"parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+		},
+	}]
+	_, optional_bottom = gt.build_tools_instruction(optional_read)
+	assert '"path": "README.md"' in optional_bottom
+
+	# Enum, const and nested required properties follow their declared schema.
+	complex_tool = [{
+		"type": "function",
+		"function": {
+			"name": "inspect",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"options": {"type": "object", "required": ["mode", "format"], "properties": {
+						"mode": {"type": "string", "enum": ["safe", "full"]},
+						"format": {"type": "string", "const": "json"},
+					}},
+				},
+				"required": ["options"],
+			},
+		},
+	}]
+	_, complex_bottom = gt.build_tools_instruction(complex_tool)
+	assert '"options": {"mode": "safe", "format": "json"}' in complex_bottom
+
+	# Mutating tools, including camelCase and unfamiliar APIs, must not get runnable samples.
+	mutating = [{
+		"type": "function",
+		"function": {
+			"name": "sendMessage",
+			"parameters": {
+				"type": "object",
+				"properties": {"recipient": {"type": "string"}, "body": {"type": "string"}},
+				"required": ["recipient", "body"],
+			},
+		},
+	}]
+	_, mutating_bottom = gt.build_tools_instruction(mutating)
+	assert '"name": "sendMessage"' not in mutating_bottom
+	assert "Do not issue a sample call" in mutating_bottom
+
+	unknown = [{
+		"type": "function",
+		"function": {
+			"name": "accountAction",
+			"parameters": {"type": "object", "properties": {"account_id": {"type": "string"}}},
+		},
+	}]
+	_, unknown_bottom = gt.build_tools_instruction(unknown)
+	assert '"name": "accountAction"' not in unknown_bottom
+	assert "Do not issue a sample call" in unknown_bottom
+
+
+def test_tool_contract_requires_verified_code_change_loop():
+	top, bottom = gt.build_tools_instruction(TOOLS)
+	assert "regression tests" in top
+	assert "full suite passes after the final edit" in bottom
+	assert "run baseline tests" in top
+	assert "full relevant suite after the LAST edit" in top
+	assert "fix and rerun failures" in top
+	for check in ("git diff --check", "git diff", "git status --short"):
+		assert check in top
+		assert check in bottom
+	assert "After every result call the next" in top
+	assert "do not answer before all checks pass" in top
+	assert "no proposal or unverified final answer" in bottom
+	assert "never invent access or quota limits" in top
+	assert "If a check fails, fix the reported issue" in bottom
+	assert "rerun the full suite and all three checks" in bottom
 
 
 def test_forced_tool_contract_keeps_its_name():

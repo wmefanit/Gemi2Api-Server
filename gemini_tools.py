@@ -81,6 +81,92 @@ def _iter_tool_definitions(tools: Iterable[Any]) -> Iterable[Dict[str, Any]]:
 		}
 
 
+def _example_schema_value(schema: Any, field_name: str = "") -> Any:
+	"""Build a small, workspace-safe example value matching a JSON Schema field."""
+	if not isinstance(schema, dict):
+		return "example"
+	if "const" in schema:
+		return schema["const"]
+	choices = schema.get("enum")
+	if isinstance(choices, list) and choices:
+		return choices[0]
+	type_name = schema.get("type")
+	if isinstance(type_name, list):
+		type_name = next((kind for kind in type_name if kind != "null"), "null")
+	if type_name == "object":
+		properties = schema.get("properties")
+		if not isinstance(properties, dict):
+			return {}
+		required = schema.get("required")
+		names = required if isinstance(required, list) else list(properties)[:1]
+		return {
+			name: _example_schema_value(properties.get(name), str(name))
+			for name in names
+			if isinstance(name, str)
+		}
+	if type_name == "array":
+		return []
+	if type_name == "boolean":
+		return False
+	if type_name == "integer":
+		return schema.get("minimum", 1)
+	if type_name == "number":
+		return schema.get("minimum", 1)
+	if type_name == "string":
+		field = field_name.lower()
+		if "command" in field:
+			return "ls -la"
+		if "path" in field or "file" in field:
+			return "README.md"
+		if "dir" in field or field in ("cwd", "working_directory"):
+			return "."
+		return "example"
+	return None
+
+
+def _example_tool_arguments(definition: Dict[str, Any]) -> Dict[str, Any]:
+	"""Build an example containing required fields with safe workspace-local values."""
+	parameters = definition.get("parameters") or {}
+	properties = parameters.get("properties") if isinstance(parameters, dict) else None
+	if not isinstance(properties, dict):
+		return {}
+	required = parameters.get("required")
+	names = required if isinstance(required, list) else list(properties)[:1]
+	tool_name = definition.get("name", "").lower()
+	return {
+		name: (
+			"example.txt"
+			if "write" in tool_name
+			and isinstance(name, str)
+			and ("path" in name.lower() or "file" in name.lower())
+			and isinstance(properties.get(name), dict)
+			and properties[name].get("type") == "string"
+			and "enum" not in properties[name]
+			and "const" not in properties[name]
+			else _example_schema_value(properties.get(name), str(name))
+		)
+		for name in names
+		if isinstance(name, str)
+	}
+
+
+def _tool_has_obvious_side_effects(name: str) -> bool:
+	"""Only auto-example tools whose names clearly imply read-only behavior."""
+	separated_name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+	tokens = set(re.split(r"[^a-z0-9]+", separated_name.lower()))
+	mutating_verbs = {
+		"write", "delete", "remove", "create", "update", "set", "insert",
+		"send", "submit", "post", "put", "patch", "commit", "move", "copy",
+		"purchase", "transfer", "upload", "publish", "execute", "run", "approve",
+		"cancel", "charge", "disable", "enable", "grant", "revoke", "ban", "kick",
+	}
+	read_only_verbs = {
+		"read", "list", "get", "search", "query", "find", "fetch", "inspect",
+		"lookup", "check", "show", "describe", "view", "status",
+	}
+	return not bool(tokens & read_only_verbs) or bool(tokens & mutating_verbs)
+
+
 def build_tools_instruction(tools: Optional[List[Any]], tool_choice: Any = None) -> Tuple[str, str]:
 	"""生成 (顶部工具接口块, 末尾再锚一次的提醒)；没有可用工具时返回 ("", "")。
 
@@ -129,6 +215,11 @@ def build_tools_instruction(tools: Optional[List[Any]], tool_choice: Any = None)
 		"session, so use the caller's tools above for any file, shell or workspace operation.\n"
 		"- Do not add prose around the marker.\n"
 		"- After the caller returns a tool result, continue the task with that result.\n"
+		"- For repository coding tasks, inspect instructions/source/tests, run baseline tests, edit implementation and regression tests, "
+		"run the full relevant suite after the LAST edit (fix and rerun failures), then run `git diff --check`, `git diff`, and "
+		"`git status --short` separately. After every result call the next unfinished step; do not answer before all checks pass. "
+		"A read, plan, write, or earlier test pass is not completion. Report only verified facts. For real tool errors, retry "
+		"or state the exact blocker; never invent access or quota limits.\n"
 		"- If no tool is needed, answer normally in plain text without a marker.\n"
 		"- Call at most one tool per turn.\n"
 	)
@@ -139,13 +230,17 @@ def build_tools_instruction(tools: Optional[List[Any]], tool_choice: Any = None)
 	top += "</caller_tool_interface>"
 
 	# 末尾再锚一次：agentic 客户端自带的开发者提示动辄几十 KB，会把中间的格式指令
-	# 冲掉。示例用真实工具名与真实参数，弱模型照抄的命中率明显更高。
-	example_name = forced or definitions[0]["name"]
-	example_args = (
-		{"command": "ls -la"}
-		if example_name in ("run_command", "shell", "bash", "execute_command")
-		else {"path": "/etc/hostname"}
-	)
+	# 冲掉。示例用真实工具名及符合必填字段 schema 的工作区内参数。
+	command_tools = {"run_command", "shell", "bash", "execute_command"}
+	if forced:
+		example_definition = definitions[0]
+	else:
+		example_definition = next(
+			(d for d in definitions if d["name"] in command_tools),
+			next((d for d in definitions if d["name"] in ("read_file", "read", "list_files")), definitions[0]),
+		)
+	example_name = example_definition["name"]
+	example_args = _example_tool_arguments(example_definition)
 	# 底部提醒必须自包含：长 developer prompt（Claude Code / Cline 动辄几十 KB）会把
 	# 顶部接口块挤出注意力，只写"上面那个仍然有效"模型根本对不上号，实测 9KB 规则 +
 	# 模糊任务会退化成"我无法访问你的文件系统"。这里直接重申工具名与参数，不依赖上文。
@@ -153,8 +248,29 @@ def build_tools_instruction(tools: Optional[List[Any]], tool_choice: Any = None)
 		f"{d['name']}({', '.join((d.get('parameters') or {}).get('properties', {}) or [])})"
 		for d in definitions
 	)
-	bottom = (
-		"<caller_tool_interface_reminder>\n"
+	if (
+		_tool_has_obvious_side_effects(example_name)
+		and not (
+			example_name in command_tools
+			and example_args.get("command") == "ls -la"
+		)
+	):
+		example_section = (
+			"Do not issue a sample call: this tool can change user data. Call it only with "
+			"arguments grounded in the user's request and the inspected workspace.\n"
+		)
+	else:
+		example_section = (
+			"Example of a correct turn:\n"
+			+ TOOL_FENCE_OPEN
+			+ "\n"
+			+ json.dumps({"name": example_name, "arguments": example_args}, ensure_ascii=False)
+			+ "\n"
+			+ TOOL_FENCE_CLOSE
+			+ "\n"
+		)
+	bottom = (
+		"<caller_tool_interface_reminder>\n"
 		"The caller tool interface above still applies and outranks any earlier style rules. "
 		"Tools available right now: "
 		+ tool_index
@@ -163,14 +279,11 @@ def build_tools_instruction(tools: Optional[List[Any]], tool_choice: Any = None)
 		"explanation, no bash/python block for the user to run, and no claim that you lack "
 		"access to the caller's environment. There is no call quota, counter or budget in this "
 		"session, so never report one.\n"
-		"Example of a correct turn:\n"
-		+ TOOL_FENCE_OPEN
-		+ "\n"
-		+ json.dumps({"name": example_name, "arguments": example_args}, ensure_ascii=False)
-		+ "\n"
-		+ TOOL_FENCE_CLOSE
-		+ "\n"
-		"If no tool is needed, answer normally in plain text without a marker.\n"
+		"Repository task is not complete until the full suite passes after the final edit and these separate checks pass: `git diff --check`, "
+		"`git diff`, `git status --short`. If a check fails, fix the reported issue, rerun the full suite and all three checks; "
+		"only then report completion. After each result call the next unfinished step; no proposal or unverified final answer.\n"
+		+ example_section
+		+ "If no tool is needed, answer normally in plain text without a marker.\n"
 		"</caller_tool_interface_reminder>"
 	)
 	return top, bottom
