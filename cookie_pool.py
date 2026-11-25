@@ -29,12 +29,21 @@ import json
 import logging
 import os
 import re
+import ssl
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 from gemini_webapi import GeminiClient
+from gemini_webapi.exceptions import TemporarilyBlockedError
+
+try:
+	from curl_cffi.curl import CurlError as CurlError
+	from curl_cffi.requests.exceptions import SSLError as CurlSSLError
+except ImportError:  # pragma: no cover - curl_cffi is a runtime dependency
+	CurlError = ()
+	CurlSSLError = ()
 
 logger = logging.getLogger(__name__)
 
@@ -319,6 +328,32 @@ def looks_like_auth_failure(message: str) -> bool:
 	return any(hint in lowered for hint in AUTH_FAILURE_HINTS)
 
 
+def is_transient_network_failure(error: BaseException) -> bool:
+	"""标记与账号身份无关的网络/出口失败，不对 Cookie 槽位施加冷却或降级。"""
+	seen = set()
+	current = error
+	while current is not None and id(current) not in seen:
+		seen.add(id(current))
+		if isinstance(current, (TemporarilyBlockedError, ssl.SSLError)) or (
+			CurlSSLError and isinstance(current, CurlSSLError)
+		):
+			return True
+		message = str(current).lower()
+		if re.search(
+			r"curl:\s*\(?35\)?|ssl_connect|ssl_error_syscall|"
+			r"your ip address has been temporarily flagged or blocked by google",
+			message,
+		):
+			return True
+		if CurlError and isinstance(current, CurlError):
+			# CurlError also represents timeouts and unrelated transport failures. Treat
+			# only libcurl's explicit TLS handshake error (35) as this transient class.
+			if getattr(current, "code", None) == 35:
+				return True
+		current = current.__cause__ or current.__context__
+	return False
+
+
 async def _safe_close(client: Any) -> None:
 	try:
 		await client.close()
@@ -346,6 +381,7 @@ class ClientSlot:
 		self.inflight = 0
 		self.successes = 0
 		self.failures = 0
+		self.account_failures = 0
 		self.cooldown_until = 0.0
 		self.last_used = 0.0
 		self.last_error = ""
@@ -469,7 +505,7 @@ class CookiePool:
 		candidates = [slot for slot in self.slots if slot.entry.psid not in exclude and slot.available(now)]
 		if not candidates:
 			return None
-		healthy = [slot for slot in candidates if slot.failures < self.degrade_after]
+		healthy = [slot for slot in candidates if slot.account_failures < self.degrade_after]
 		if healthy:
 			candidates = healthy
 		if self.max_concurrency > 0:
@@ -620,22 +656,34 @@ class CookiePool:
 		"""这个账号这次成功了：清空失败计数和冷却。"""
 		slot.successes += 1
 		slot.failures = 0
+		slot.account_failures = 0
 		slot.cooldown_until = 0.0
 		slot.last_error = ""
 
 	def report_failure(self, slot: ClientSlot, error: BaseException, permanent: bool = False) -> None:
-		"""这个账号这次失败了：指数退避冷却，会话失效时丢掉客户端下次重建。
+		"""记录失败；只对账号级错误做指数退避，网络错误不惩罚 Cookie 槽位。
 
 		``permanent=True`` 用于「连客户端都建不起来」的情况（cookie 本身坏了）：
 		直接打到降级阈值并给足冷却，避免每轮请求都白花一次初始化和校验的时间。
 		"""
 		slot.failures += 1
 		slot.last_error = str(error)[:300]
-		if permanent:
-			slot.failures = max(slot.failures, self.degrade_after)
-		delay = min(self.cooldown_max, self.cooldown_base * (2 ** (slot.failures - 1)))
-		if permanent:
-			delay = self.cooldown_max
+		transient_network = is_transient_network_failure(error)
+		if transient_network:
+			# SSL/出口 1060 是网络路径状态，不是账号状态；代理可换出口，立刻允许重试。
+			delay = 0.0
+			# 丢弃失败的连接池，使后续请求重新建连接并有机会取得代理的另一条出口线路。
+			client = slot.client
+			if client is not None:
+				slot.client = None
+				_schedule_close(client)
+		else:
+			slot.account_failures += 1
+			if permanent:
+				slot.account_failures = max(slot.account_failures, self.degrade_after)
+			delay = min(self.cooldown_max, self.cooldown_base * (2 ** (slot.account_failures - 1)))
+			if permanent:
+				delay = self.cooldown_max
 		slot.cooldown_until = time.time() + delay
 
 		client = slot.client
@@ -646,10 +694,10 @@ class CookiePool:
 			_schedule_close(client)
 
 		logger.warning(
-			"账号 %s 失败第 %s 次，冷却 %.0fs%s（%s）",
+			"账号 %s 失败第 %s 次，%s%s（%s）",
 			slot.entry.name,
 			slot.failures,
-			delay,
+			"网络瞬时失败，不冷却账号槽位" if transient_network else f"冷却 {delay:.0f}s",
 			dropped,
 			slot.last_error,
 		)

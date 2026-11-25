@@ -99,14 +99,12 @@ def test_acquire_fails_fast_when_cooldown_longer_than_wait():
 	assert elapsed < 0.3, elapsed
 
 
-def test_transient_init_error_uses_short_cooldown(monkeypatch):
-	"""握手抖动（curl 35）不该把账号冻 300s——之前 permanent 一律 True 就是这样。"""
+def test_ssl_init_error_does_not_cool_or_degrade_account(monkeypatch):
+	"""curl 35 是出口/网络问题，不能把整个账号槽位冷却或降级。"""
 
 	class _SslBlip(_UpstreamDefaults):
 		async def init(self, timeout=None, **kwargs):
-			raise RuntimeError(
-				"Failed to perform, curl: (35) BoringSSL SSL_connect: Connection closed abruptly"
-			)
+			raise cookie_pool.CurlError("curl: (35) SSL_ERROR_SYSCALL")
 
 	monkeypatch.setattr(cookie_pool, "GeminiClient", _SslBlip)
 	pool = _pool(cooldown_wait=0.0)
@@ -119,7 +117,59 @@ def test_transient_init_error_uses_short_cooldown(monkeypatch):
 	slot = pool.slots[0]
 	remaining = slot.cooldown_until - time.time()
 	assert slot.failures == 1
-	assert remaining <= pool.cooldown_base + 1, remaining
+	assert slot.account_failures == 0
+	assert remaining <= 0.05, remaining
+
+
+def test_temporarily_blocked_1060_does_not_cool_or_degrade_account():
+	pool = _pool()
+	slot = pool.slots[0]
+	error = cookie_pool.TemporarilyBlockedError("Google temporarily blocked this request")
+
+	for _ in range(pool.degrade_after + 2):
+		pool.report_failure(slot, error)
+
+	assert slot.failures == pool.degrade_after + 2
+	assert slot.account_failures == 0
+	assert slot.cooldown_until <= time.time()
+	assert pool._pick(set()) is slot
+
+
+def test_wrapped_ssl_handshake_error_is_transient_but_other_curl_errors_are_not():
+	ssl_error = cookie_pool.CurlSSLError("curl: (35) SSL_connect closed")
+	wrapped = RuntimeError("upstream request failed")
+	wrapped.__cause__ = ssl_error
+	assert cookie_pool.is_transient_network_failure(wrapped)
+
+	timeout = cookie_pool.CurlError("curl: (28) operation timed out")
+	assert not cookie_pool.is_transient_network_failure(timeout)
+	assert cookie_pool.is_transient_network_failure(
+		RuntimeError("Your IP address has been temporarily flagged or blocked by Google")
+	)
+	assert cookie_pool.is_transient_network_failure(
+		RuntimeError("curl: (35) Connection closed abruptly by the remote SSL endpoint")
+	)
+
+
+def test_transient_generation_failure_discards_client_but_allows_immediate_retry():
+	pool = _pool()
+
+	async def run():
+		lease = await pool.acquire()
+		failed_client = lease.client
+		lease.fail(cookie_pool.TemporarilyBlockedError("Google error 1060"))
+		lease.release()
+		assert pool.slots[0].client is None
+		assert pool.slots[0].cooldown_until <= time.time()
+		retry = await pool.acquire()
+		retry_client = retry.client
+		retry.release()
+		await asyncio.sleep(0)
+		return failed_client, retry_client
+
+	failed_client, retry_client = asyncio.run(run())
+	assert failed_client is not retry_client
+	assert pool.slots[0].account_failures == 0
 
 
 def test_auth_failure_still_gets_long_cooldown(monkeypatch):
